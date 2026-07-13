@@ -96,13 +96,11 @@ session_label = f"Session (Claude {plan})" if plan else "Session"
 # never an API key — it draws Session/All models/Fable first, then overflows
 # into Plan credits if that toggle is on. API credits (platform.claude.com)
 # is a separate account this terminal never touches.
-sub_label = f"  {GRAY}Claude {plan} subscription (active){RESET}" if plan else ""
 lines = [
-    sub_label,
     render_row(session_label, usage.get("current_session")),
     render_row("All models", usage.get("all_models")),
     render_row("Fable", usage.get("fable")),
-    f"  {GRAY}─────────────────────────{RESET}",
+    f"  {GRAY}Claude {plan} subscription (active){RESET}" if plan else "",
     render_credits("Plan credits", usage.get("credits")),
     f"  {GRAY}↑ usage-credits overflow (optional add-on){RESET}",
     render_credits("API credits", usage.get("console_credits")),
