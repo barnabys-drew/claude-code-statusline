@@ -104,15 +104,17 @@ lines = [
     render_credits("Plan credits", usage.get("credits")),
     f"  {GRAY}↑ usage-credits overflow (optional add-on){RESET}",
     render_credits("API credits", usage.get("console_credits")),
-    f"  {GRAY}↑ separate account — not used by Claude Code{RESET}",
 ]
 lines = [l for l in lines if l]  # filter out empty strings
+
+# Add the API credits annotation with timestamp on same line
 if updated_at:
     age_str = fmt_age(updated_at)
     stale_note = " (stale)" if is_stale else ""
-    lines.append(f"  {GRAY}  updated {age_str}{stale_note}{RESET}")
+    api_line = f"  {GRAY}↑ separate account — not used by Claude Code  updated {age_str}{stale_note}{RESET}"
 else:
-    lines.append(f"  {GRAY}  no usage scrape yet — run scrape_claude_usage.py{RESET}")
+    api_line = f"  {GRAY}↑ separate account — not used by Claude Code  (no scrape yet){RESET}"
+lines.append(api_line)
 
 budget_block = "\n".join(lines)
 budget_lines_b64 = base64.b64encode(budget_block.encode()).decode()
