@@ -1,0 +1,8 @@
+# Local cache/log files this tool generates — never commit real usage/billing data
+claude-usage-cache.json
+scrape_claude_usage.log
+*.log
+
+.DS_Store
+__pycache__/
+*.pyc
