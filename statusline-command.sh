@@ -90,13 +90,14 @@ def render_credits(label, entry):
     return f"  {dot} {CYAN}{label:<14}{RESET} {BOLD}{p:5.1f}%{RESET}  {BLUE}{bar(p)}{RESET}  {GRAY}{detail}{RESET}{warn}"
 
 plan = usage.get("plan")
-session_label = f"Session ({plan})" if plan else "Session"
+session_label = f"Session (Claude {plan})" if plan else "Session"
 
 # This terminal authenticates via claudeAiOauth (~/.claude/.credentials.json),
 # never an API key — it draws Session/All models/Fable first, then overflows
 # into Plan credits if that toggle is on. API credits (platform.claude.com)
 # is a separate account this terminal never touches.
 lines = [
+    f"  {GRAY}Claude {plan} subscription{RESET}" if plan else "",
     render_row(session_label, usage.get("current_session")),
     render_row("All models", usage.get("all_models")),
     render_row("Fable", usage.get("fable")),
@@ -105,6 +106,7 @@ lines = [
     render_credits("API credits", usage.get("console_credits")),
     f"  {GRAY}  ↑ separate account — not used by Claude Code{RESET}",
 ]
+lines = [l for l in lines if l]  # filter out empty strings
 if updated_at:
     age_str = fmt_age(updated_at)
     stale_note = " (stale)" if is_stale else ""
