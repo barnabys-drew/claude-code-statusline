@@ -9,16 +9,16 @@ balance).
 
 ```
  my-project 
-  ● Context      12.0%  ▬○○○○○○○○○  ↓41.0k  ↑261  ~40.6k
-  ● Session (Pro) 34.0%  ▬▬▬○○○○○○○  resets in 3 hr 12 min
-  ● All models    41.0%  ▬▬▬▬○○○○○○  resets Fri 2:00 PM
-  ● Fable         62.0%  ▬▬▬▬▬▬○○○○  resets Fri 2:00 PM
-  ● Plan credits  55.0%  ▬▬▬▬▬○○○○○  $82.50/$150.00 resets Aug 1  bal $67.50
-  ↑ this terminal draws from
-  ● API credits   20.0%  ▬▬○○○○○○○○  $10.00/$50 resets Aug 1
-  ↑ separate account — not used by Claude Code
-  updated 2m ago
-  Sonnet 5 (1M context)  |  my-org/my-project  main
+  ● Context   12.0%  ▬○○○○○○○○○  ↓41.0k  ↑261  ~40.6k
+  ● Session (Claude Pro)  34.0%  ▬▬▬○○○○○○○  resets in 3 hr 12 min
+  ● All models      41.0%  ▬▬▬▬○○○○○○  resets Fri 2:00 PM
+  ● Fable           62.0%  ▬▬▬▬▬▬○○○○  resets Fri 2:00 PM
+  Claude Pro subscription (active)
+  ● Plan credits    55.0%  ▬▬▬▬▬○○○○○  $82.50/$150.00 resets Aug 1  bal $67.50
+  ↑ usage-credits overflow (optional add-on)
+  ● API credits     20.0%  ▬▬○○○○○○○○  $10.00/$50 resets Aug 1
+  ↑ separate account — not used by Claude Code  updated 2m ago
+  Sonnet 5 (1M context)  |  ...my-org/my-project  main
 ```
 
 (Numbers above are illustrative, not real billing data.)
