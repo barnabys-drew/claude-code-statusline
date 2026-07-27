@@ -2,20 +2,59 @@
 # Claude Code custom statusline.
 # Requires: python3, git (optional)
 
-# The rate_limits object in the hook payload only ever reports the blended
-# "All models" bucket, even when Fable is the active model — Fable's own
-# dedicated quota isn't exposed to the CLI at all. ~/.claude/scripts/
-# scrape_claude_usage.py (run on a cron) pulls the real per-model numbers
-# from the claude.ai usage settings page instead; this just reads that cache.
+# Quota rows come straight from the hook payload (rate_limits.five_hour and
+# .seven_day), which is live, exact, and carries reset times as unix epochs.
+#
+# This used to be scraped from the claude.ai settings page, because the page
+# also carried a per-model Fable cap the CLI never exposed. That cap no longer
+# exists — the page now shows only "Current session" and "All models", the same
+# two buckets the payload already provides — so the scrape was pure overhead
+# for those rows and is gone.
+#
+# scripts/scrape_claude_usage.py is still the only source for the two billing
+# rows (usage credits, Console API credits), which the payload does not carry.
+# Those move slowly, so a stale reading there is far less misleading than a
+# stale session quota was.
+#
+# Rows are configurable via STATUSLINE_ROWS — see ROW_BUILDERS below.
 IFS='|' read -r session_name model_name ctx_size used_pct total_in total_out \
                cache_tokens cwd repo_owner repo_name git_worktree \
                budget_lines_b64 < <(python3 -c '
-import sys, json, os, time, base64
+import sys, json, os, time, base64, datetime
 
 try:
     d = json.load(sys.stdin)
 except Exception:
     d = {}
+
+def _fmt_delta(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return "under a min"
+    h, m = divmod(seconds // 60, 60)
+    if h and m:
+        return f"{h} hr {m} min"
+    if h:
+        return f"{h} hr"
+    return f"{m} min"
+
+def fmt_epoch(ts):
+    """Render a rate_limits resets_at (unix epoch) as a countdown when it is
+    close and an absolute stamp when it is not.
+
+    The payload giving epochs is what let the old weekday-string parser go. It
+    had to guess which Friday "Fri 1:59 PM" meant, re-guessed on every render,
+    and so could never show a reset as overdue."""
+    try:
+        ts = float(ts)
+    except Exception:
+        return "-"
+    delta = ts - time.time()
+    if delta <= 0:
+        return "now"
+    if delta < 86400:
+        return "in " + _fmt_delta(delta)
+    return datetime.datetime.fromtimestamp(ts).strftime("%a %b %-d, %-I:%M %p")
 
 def g(*keys):
     node = d
@@ -32,6 +71,7 @@ cache_tok = (cu.get("cache_read_input_tokens") or 0) + (cu.get("cache_creation_i
 
 GREEN="\033[0;32m"; CYAN="\033[0;36m"; GRAY="\033[0;90m"
 BLUE="\033[0;34m"; BOLD="\033[1m"; RESET="\033[0m"; RED="\033[0;31m"
+YELLOW="\033[0;33m"
 
 def bar(pct):
     try:
@@ -39,7 +79,12 @@ def bar(pct):
     except Exception:
         pct = 0.0
     width = 10
-    filled = max(0, min(width, int((pct / 100) * width)))
+    # Round rather than truncate: int() made 99.9% and 90% render identically.
+    filled = max(0, min(width, int(round((pct / 100) * width))))
+    # Never show a full bar below the cap — a rounded 95% must stay visibly short
+    # of 100%, or "nearly out" and "out" look the same.
+    if filled == width and pct < 100:
+        filled = width - 1
     return "▬" * filled + "○" * (width - filled)
 
 def fmt_age(updated_at):
@@ -52,7 +97,8 @@ def fmt_age(updated_at):
         return f"{diff / 3600:.1f}h ago"
     return f"{int(diff / 86400)}d ago"
 
-usage_cache_path = os.path.expanduser("~/.claude/claude-usage-cache.json")
+usage_cache_path = os.path.expanduser(
+    os.environ.get("CLAUDE_USAGE_CACHE") or "~/.claude/claude-usage-cache.json")
 try:
     with open(usage_cache_path) as f:
         usage = json.load(f)
@@ -63,58 +109,148 @@ updated_at = usage.get("updated_at")
 STALE_AFTER = 900  # 3x the 5-min scrape interval
 is_stale = (updated_at is None) or (time.time() - updated_at > STALE_AFTER)
 
-def render_row(label, entry):
-    if not entry:
-        return f"  {GRAY}○{RESET} {CYAN}{label:<14}{RESET} {GRAY}no data{RESET}"
-    p = float(entry.get("used_pct", 0))
-    resets = entry.get("resets", "-")
-    dot = f"{GRAY}○{RESET}" if is_stale else f"{GREEN}●{RESET}"
-    return f"  {dot} {CYAN}{label:<14}{RESET} {BOLD}{p:5.1f}%{RESET}  {BLUE}{bar(p)}{RESET}  {GRAY}resets {resets}{RESET}"
+# "Session (Claude Pro)" is 20 chars and used to overflow a 14-char field,
+# knocking that one row out of alignment with the four below it.
+LBL = 20
+
+def row_age(entry):
+    """Per-row fetch time. cache.update() merges partial scrapes, so a row whose
+    regex quietly stopped matching keeps its old value under a fresh top-level
+    updated_at — only the row stamp catches that."""
+    ts = (entry or {}).get("_fetched_at") or updated_at
+    return (None if ts is None else time.time() - ts), ts
+
+def row_dot(entry):
+    age, _ = row_age(entry)
+    if age is None or age > STALE_AFTER:
+        return f"{GRAY}○{RESET}"
+    return f"{GREEN}●{RESET}"
+
+def row_mark(entry):
+    """Flag a row that is materially older than the scrape as a whole."""
+    age, ts = row_age(entry)
+    if age is None or updated_at is None:
+        return ""
+    if age - (time.time() - updated_at) > STALE_AFTER:
+        return f"  {YELLOW}(row from {fmt_age(ts)}){RESET}"
+    return ""
+
+def render_live(label, bucket):
+    """A quota row from the payload. Always current, so no staleness marking —
+    it is read fresh on every render rather than out of a cache."""
+    if not bucket:
+        return None  # rate_limits is absent until the first API response
+    p = float(bucket.get("used_percentage") or 0)
+    resets = fmt_epoch(bucket.get("resets_at"))
+    return (f"  {GREEN}●{RESET} {CYAN}{label:<{LBL}}{RESET} {BOLD}{p:5.1f}%{RESET}  "
+            f"{BLUE}{bar(p)}{RESET}  {GRAY}resets {resets}{RESET}")
 
 def render_credits(label, entry):
     if not entry:
-        return f"  {GRAY}○{RESET} {CYAN}{label:<14}{RESET} {GRAY}no data{RESET}"
+        return f"  {GRAY}○{RESET} {CYAN}{label:<{LBL}}{RESET} {GRAY}no data{RESET}"
     p = float(entry.get("used_pct", 0))
-    dot = f"{GRAY}○{RESET}" if is_stale else f"{GREEN}●{RESET}"
     spent = entry.get("spent")
     limit = entry.get("limit")
-    resets = entry.get("resets", "-")
+    # Billing reset strings ("Aug 1", "Aug 1, 2026") are already unambiguous,
+    # so they print as scraped.
+    resets = entry.get("resets") or "-"
     detail = f"${spent}/${limit} resets {resets}"
     bal = entry.get("balance")
     warn = ""
     if bal:
-        detail += f"  bal {bal}"
+        # Labelled "credit" rather than "bal": this is a prepaid credit balance,
+        # not limit-minus-spent, and reading it as remaining budget is wrong.
+        detail += f"  credit {bal}"
         if bal.strip().startswith("-"):
             auto_reload = entry.get("auto_reload", "?")
             warn = f"  {RED}{BOLD}![unpaid, auto-reload {auto_reload}]{RESET}"
-    return f"  {dot} {CYAN}{label:<14}{RESET} {BOLD}{p:5.1f}%{RESET}  {BLUE}{bar(p)}{RESET}  {GRAY}{detail}{RESET}{warn}"
+    return (f"  {row_dot(entry)} {CYAN}{label:<{LBL}}{RESET} {BOLD}{p:5.1f}%{RESET}  "
+            f"{BLUE}{bar(p)}{RESET}  {GRAY}{detail}{RESET}{warn}{row_mark(entry)}")
 
 plan = usage.get("plan")
-session_label = f"Session (Claude {plan})" if plan else "Session"
+rate_limits = d.get("rate_limits") or {}
 
-# This terminal authenticates via claudeAiOauth (~/.claude/.credentials.json),
-# never an API key — it draws Session/All models/Fable first, then overflows
-# into Plan credits if that toggle is on. API credits (platform.claude.com)
-# is a separate account this terminal never touches.
-lines = [
-    render_row(session_label, usage.get("current_session")),
-    render_row("All models", usage.get("all_models")),
-    render_row("Fable", usage.get("fable")),
-    f"  {GRAY}Claude {plan} subscription (active){RESET}" if plan else "",
-    render_credits("Plan credits", usage.get("credits")),
-    f"  {GRAY}↑ usage-credits overflow (optional add-on){RESET}",
-    render_credits("API credits", usage.get("console_credits")),
-]
-lines = [l for l in lines if l]  # filter out empty strings
+# Which rows to draw, in order. Override with STATUSLINE_ROWS, e.g.
+#   STATUSLINE_ROWS=session,weekly          # quota only, no billing
+#   STATUSLINE_ROWS=session,weekly,plan_credits
+#
+# Any rate_limits bucket can be added as "rl:<key>[=Label]" without touching
+# this file. That is the hook for a per-model cap coming back: Anthropic
+# retired the Fable-specific quota, but if a bucket like rate_limits.opus
+# appears, STATUSLINE_ROWS=session,weekly,rl:opus=Opus renders it. Only the
+# payload key needs to exist — there is no scraping involved.
+DEFAULT_ROWS = "session,weekly,plan_credits,api_credits"
 
-# Add the API credits annotation with timestamp on same line
-if updated_at:
-    age_str = fmt_age(updated_at)
-    stale_note = " (stale)" if is_stale else ""
-    api_line = f"  {GRAY}↑ separate account — not used by Claude Code  updated {age_str}{stale_note}{RESET}"
+def build_session():
+    label = f"Session (Claude {plan})" if plan else "Session"
+    return [render_live(label, rate_limits.get("five_hour"))]
+
+def build_weekly():
+    row = render_live("All models", rate_limits.get("seven_day"))
+    if not row:
+        return []  # annotation must not outlive the row it annotates
+    sub = f"  {GRAY}Claude {plan} subscription (active){RESET}" if plan else None
+    return [row, sub]
+
+def build_plan_credits():
+    return [render_credits("Plan credits", usage.get("credits")),
+            f"  {GRAY}↑ usage-credits overflow (optional add-on){RESET}"]
+
+def build_api_credits():
+    return [render_credits("API credits", usage.get("console_credits")),
+            f"  {GRAY}↑ separate account — not used by Claude Code{RESET}"]
+
+ROW_BUILDERS = {
+    "session": build_session,
+    "weekly": build_weekly,
+    "plan_credits": build_plan_credits,
+    "api_credits": build_api_credits,
+}
+
+wanted = [r.strip() for r in os.environ.get("STATUSLINE_ROWS", DEFAULT_ROWS).split(",") if r.strip()]
+uses_cache = any(r in ("plan_credits", "api_credits") for r in wanted)
+
+lines = []
+for row_id in wanted:
+    if row_id.startswith("rl:"):
+        spec = row_id[3:]
+        key, _, label = spec.partition("=")
+        lines.append(render_live(label or key.replace("_", " ").title(), rate_limits.get(key)))
+    else:
+        builder = ROW_BUILDERS.get(row_id)
+        if builder:
+            lines.extend(builder())
+lines = [l for l in lines if l]  # drop absent rows and empty annotations
+
+# Freshness gets its own line. It used to be appended to the API-credits
+# footnote above, where the leading arrow tied it visually to that one row —
+# so a whole-cache staleness warning read as a note about API credits, and the
+# five rows above it looked live when they were two days old.
+_REASONS = {
+    "no-cdp": "Chrome not on debug port :9222",
+    "no-data": "page scrape returned nothing (session expired?)",
+    "error":   "scraper crashed",
+}
+last_run = usage.get("last_run") or {}
+status = last_run.get("status")
+
+if not uses_cache:
+    # No cached row is displayed, so there is nothing whose freshness matters
+    # and no reason to mention the scraper at all.
+    pass
+elif updated_at is None:
+    lines.append(f"  {RED}{BOLD}⚠ no usage data yet — bash ~/.claude/scripts/fix_usage_scrape.sh{RESET}")
+elif is_stale:
+    why = _REASONS.get(status, "scraper not running")
+    if status in ("ok", "partial", None) and last_run.get("at"):
+        why = "last run " + fmt_age(last_run["at"])
+    lines.append(f"  {RED}{BOLD}⚠ usage data {fmt_age(updated_at)} — {why}{RESET}"
+                 f"  {RED}fix: bash ~/.claude/scripts/fix_usage_scrape.sh{RESET}")
+elif status == "partial":
+    missed = ", ".join(last_run.get("failed") or []) or "some rows"
+    lines.append(f"  {YELLOW}◑ partial scrape {fmt_age(updated_at)} — missed {missed}{RESET}")
 else:
-    api_line = f"  {GRAY}↑ separate account — not used by Claude Code  (no scrape yet){RESET}"
-lines.append(api_line)
+    lines.append(f"  {GRAY}usage data updated {fmt_age(updated_at)}{RESET}")
 
 budget_block = "\n".join(lines)
 budget_lines_b64 = base64.b64encode(budget_block.encode()).decode()
