@@ -19,7 +19,7 @@ count=$(powershell.exe -NoProfile -Command \
   "(Get-Process chrome -ErrorAction SilentlyContinue | Measure-Object).Count" 2>/dev/null | tr -d '\r\n ')
 
 if [ "${count:-1}" != "0" ]; then
-  echo "[usage scraper] Chrome is running without --remote-debugging-port=${DEBUG_PORT} — Fable/Sonnet usage stats will stay stale until you relaunch it with that flag." >&2
+  echo "[usage scraper] Chrome is running without --remote-debugging-port=${DEBUG_PORT} — usage stats will stay stale. Fix: bash ~/.claude/scripts/fix_usage_scrape.sh" >&2
   exit 0
 fi
 
