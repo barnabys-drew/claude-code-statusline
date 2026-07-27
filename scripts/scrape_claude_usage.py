@@ -24,22 +24,46 @@ import re
 import time
 
 CACHE_FILE = os.path.expanduser("~/.claude/claude-usage-cache.json")
+LOG_FILE = os.path.expanduser("~/.claude/scripts/scrape_claude_usage.log")
 CDP_URL = "http://localhost:9222"
+LOG_MAX_BYTES = 256_000
+
+
+def log(status, detail=""):
+    """One line per run. Silence was the original bug: cron fired every 5
+    minutes for 50 hours against a closed debug port and left no trace, so the
+    only symptom was a statusline quietly showing Friday's numbers."""
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            with open(LOG_FILE) as f:
+                tail = f.readlines()[-500:]
+            with open(LOG_FILE, "w") as f:
+                f.writelines(tail)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{stamp} {status}{(' ' + detail) if detail else ''}\n")
+    except Exception:
+        pass  # logging must never break the scrape
 
 
 def parse_usage(text):
+    """Plan name and the usage-credits pool.
+
+    The session and weekly quota rows used to be parsed here too. They now come
+    from the statusLine hook payload (rate_limits.five_hour / .seven_day), which
+    is live and carries epoch reset times, so scraping them was strictly worse.
+
+    The per-model "Fable" cap this scraper was originally written for no longer
+    exists — the usage panel lists only "Current session" and "All models". Its
+    regex silently stopped matching and, because partial results merge over the
+    cache, kept serving a frozen 100% until per-row timestamps exposed it. If a
+    per-model cap returns, read it from the payload via STATUSLINE_ROWS=rl:<key>
+    rather than reinstating a scrape.
+    """
     result = {}
     plan_m = re.search(r"Plan usage limits\s*\n\s*(\w+)\n", text)
     if plan_m:
         result["plan"] = plan_m.group(1)
-    for key, label in [
-        ("current_session", "Current session"),
-        ("all_models", "All models"),
-        ("fable", "Fable"),
-    ]:
-        m = re.search(re.escape(label) + r"\s*\n\s*Resets (.+?)\n\s*(\d+)% used", text)
-        if m:
-            result[key] = {"resets": m.group(1).strip(), "used_pct": int(m.group(2))}
 
     m = re.search(r"\$([\d,.]+) spent\s*\n\s*Resets (.+?)\n\s*(\d+)% used", text)
     limit_m = re.search(r"\$([\d,.]+)\s*\n\s*Monthly spend limit", text)
@@ -143,6 +167,25 @@ def scrape_console_billing(ctx):
             page.close()
 
 
+def record_status(status, detail=""):
+    """Record a failed run into the cache WITHOUT touching updated_at, so the
+    statusline can say *why* its numbers are old instead of only that they are.
+    Bumping updated_at here would relabel stale data as fresh."""
+    try:
+        with open(CACHE_FILE) as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    cache["last_run"] = {"at": time.time(), "status": status, "detail": detail}
+    try:
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, CACHE_FILE)
+    except Exception:
+        pass
+
+
 def main():
     from playwright.sync_api import sync_playwright
 
@@ -150,7 +193,11 @@ def main():
         try:
             browser = pw.chromium.connect_over_cdp(CDP_URL, timeout=3000)
         except Exception:
-            return  # Chrome not up on the debug port — leave cache as-is
+            # Chrome not up on the debug port — leave cache as-is. This is the
+            # common failure: Chrome relaunched without --remote-debugging-port.
+            log("FAIL", "no-cdp (Chrome not on :9222) — run fix_usage_scrape.sh")
+            record_status("no-cdp")
+            return
 
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
 
@@ -160,33 +207,71 @@ def main():
         except Exception:
             cache = {}
 
-        got_anything = False
+        # Rows this scraper no longer produces. Without pruning they would sit
+        # in the cache forever at whatever value they last held, since nothing
+        # refreshes or reads them any more.
+        for retired in ("current_session", "all_models", "fable"):
+            cache.pop(retired, None)
+
+        now = time.time()
+        fetched, failed = [], []
 
         try:
             usage = scrape_claude_ai(ctx)
             if usage:
+                # Stamp each row individually. cache.update() merges partial
+                # results over old ones, so without per-row stamps a regex that
+                # silently stops matching keeps serving a stale value forever
+                # under a fresh top-level updated_at.
+                for key, val in usage.items():
+                    if isinstance(val, dict):
+                        val["_fetched_at"] = now
                 cache.update(usage)
-                got_anything = True
-        except Exception:
-            pass
+                fetched.extend(k for k in usage if isinstance(usage[k], dict))
+            else:
+                failed.append("claude.ai:no-data")
+        except Exception as e:
+            failed.append(f"claude.ai:{type(e).__name__}")
 
         try:
             console = scrape_console_billing(ctx)
             if console:
+                console["_fetched_at"] = now
                 cache["console_credits"] = console
-                got_anything = True
-        except Exception:
-            pass
+                fetched.append("console_credits")
+            else:
+                failed.append("console:no-data")
+        except Exception as e:
+            failed.append(f"console:{type(e).__name__}")
 
-        if not got_anything:
+        if not fetched:
+            log("FAIL", "no rows scraped — " + ", ".join(failed))
+            record_status("no-data", detail=", ".join(failed))
             return
 
-        cache["updated_at"] = time.time()
+        cache["updated_at"] = now
+        cache["last_run"] = {
+            "at": now,
+            "status": "partial" if failed else "ok",
+            "fetched": sorted(fetched),
+            "failed": failed,
+        }
         tmp = CACHE_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump(cache, f)
         os.replace(tmp, CACHE_FILE)
 
+        if failed:
+            log("PARTIAL", f"got {sorted(fetched)}; missed {failed}")
+        else:
+            log("OK", f"{len(fetched)} rows")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Includes a missing playwright install, which previously produced a
+        # cron traceback nobody read.
+        log("ERROR", f"{type(e).__name__}: {e}")
+        record_status("error", f"{type(e).__name__}: {e}")
