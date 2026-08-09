@@ -235,7 +235,10 @@ That line only appears when a cached row is actually on screen.
   closes it, only when you confirm, and only via a graceful close.
 - `used_percentage` and the dollar figures are scraped independently, so they can
   disagree slightly. The "credit" figure is a prepaid balance, **not**
-  limit-minus-spent.
+  limit-minus-spent. A negative one is flagged `unpaid` only past $1 — below
+  that it is settlement lag rather than arrears, and the balance is printed
+  regardless. The flag is red on the pool that is currently paying, where it
+  stops the session, and plain yellow anywhere else.
 - The paying-pool marker is inferred, not reported: the payload has no "you are
   billing to X" field. An API key supplied outside the environment (e.g. stored
   credentials) is detected only once the session has non-zero cost and still no

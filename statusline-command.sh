@@ -191,7 +191,23 @@ def render_live(label, bucket, suffix=""):
     return bar_row(marker, label, pct,
                    "resets " + fmt_epoch(bucket.get("resets_at")), suffix)
 
-def render_credits(label, entry, marker, note=""):
+# Below this, a negative balance is settlement lag or rounding rather than an
+# account in arrears — a one-cent debt does not need a warning, and the balance
+# itself is already printed either way.
+UNPAID_MIN = 1.00
+
+def owed(bal):
+    """Dollars this account is behind, or 0. A balance renders with a leading
+    minus, e.g. -$12.40, when the account owes money."""
+    s = (bal or "").strip()
+    if not s.startswith("-"):
+        return 0.0
+    try:
+        return float("".join(c for c in s if c.isdigit() or c == "."))
+    except ValueError:
+        return 0.0
+
+def render_credits(label, entry, marker, note="", is_paying=False):
     if not entry:
         return f"  {marker} {CYAN}{label:<{LBL}}{RESET} {GRAY}no data{RESET}"
     pct = float(entry.get("used_pct", 0))
@@ -207,9 +223,17 @@ def render_credits(label, entry, marker, note=""):
         # Labelled "credit" rather than "bal": this is a prepaid credit balance,
         # not limit-minus-spent, and reading it as remaining budget is wrong.
         detail += f"  credit {bal}"
-        if bal.strip().startswith("-"):
-            auto_reload = entry.get("auto_reload", "?")
-            warn = f"  {RED}{BOLD}![unpaid, auto-reload {auto_reload}]{RESET}"
+        due = owed(bal)
+        if due >= UNPAID_MIN:
+            # Loud only when it can actually bite: an unpaid balance on the pool
+            # currently paying stops the session, on any other pool it is a
+            # note. auto-reload is only claimed when the scrape knows it.
+            ar = entry.get("auto_reload")
+            tail = f", auto-reload {ar}" if ar in ("on", "off") else ""
+            # The amount is not repeated — the balance it refers to is printed
+            # immediately to the left.
+            style = f"{RED}{BOLD}" if is_paying else YELLOW
+            warn = f"  {style}unpaid{tail}{RESET}"
     return bar_row(marker, label, pct, detail, warn + note + row_mark(entry))
 
 
@@ -309,14 +333,14 @@ def build_plan_credits():
     on = paying == "credits"
     return [render_credits("Plan credits", usage.get("credits"),
                            MARK_PAY["credits"] if on else MARK_IDLE,
-                           PAY_NOTE["credits"] if on else ""),
+                           PAY_NOTE["credits"] if on else "", on),
             f"  {GRAY}↑ overflow add-on — takes over when session/weekly hits 100%{RESET}"]
 
 def build_api_credits():
     on = paying == "api"
     return [render_credits("API credits", usage.get("console_credits"),
                            MARK_PAY["api"] if on else MARK_IDLE,
-                           PAY_NOTE["api"] if on else ""),
+                           PAY_NOTE["api"] if on else "", on),
             f"  {GRAY}↑ Console account — pays instead of the plan when authed by API key{RESET}"]
 
 ROW_BUILDERS = {
