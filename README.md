@@ -1,17 +1,49 @@
 # claude-code-statusline
 
-A [Claude Code](https://claude.com/claude-code) `statusLine` showing context
-window usage, session and weekly rate limits, session cost and burn rate, git
-state and open PR — plus, via an optional Chrome-based scraper, the two credit
-pools Anthropic exposes only on its web dashboards (the Pro/Max plan's
-usage-credit overflow, and the pay-as-you-go Console/API balance).
+A [Claude Code](https://claude.com/claude-code) `statusLine` that answers one
+question first — **which pool is paying for this session?** — and then fills in
+the detail: context window usage, session and weekly rate limits, session cost
+and burn rate, git state and open PR, plus (via an optional Chrome-based
+scraper) the two credit balances Anthropic exposes only on its web dashboards.
 
 Every row is drawn on one alignment grid, and each carries an honest freshness
 signal rather than presenting cached numbers as live.
 
 ![claude-code-statusline screenshot](assets/screenshot.png)
 
-*Illustrative numbers — not real billing data.*
+*The same session before and after its 5-hour limit runs out — the `▸` moves
+from the quota row to the credits row. Illustrative numbers, not real billing
+data.*
+
+## Which pool is paying
+
+Working with Claude Code bills to one of three pools, and the leading marker on
+each row says which one is live right now:
+
+| Marker | Meaning |
+|---|---|
+| <code>▸</code> green | **Plan quota** — the rolling 5-hour and 7-day subscription limits. Free at the point of use. |
+| <code>▸</code> yellow | **Plan credits** — the usage-credit overflow add-on, which takes over the moment either rolling limit hits 100% so the session keeps running. Real money. |
+| <code>▸</code> red | **API credits** — a Console (`platform.claude.com`) account billed per token, used when Claude Code is authenticated with an API key rather than a subscription. |
+| <code>○</code> | A billing pool that exists but is not paying for this session. |
+| <code>·</code> | Not a billing pool at all — context window, session cost estimate. |
+
+Quota and plan credits are a sequence: spend flows from the first into the
+second at 100%. API credits are an **alternative** to both — an API-key session
+never touches the subscription, and a subscription session never touches the
+Console balance. That is why only ever one `▸` is lit.
+
+The paying pool is worked out from the payload rather than configured:
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` in the environment is decisive,
+otherwise the presence of `rate_limits` marks a subscription session and its
+percentages pick quota vs. credits. Before the first API response there is
+nothing to go on, so no row is marked rather than guessing.
+
+> Earlier versions used this column for cache freshness — green for a fresh
+> scrape, gray for stale. Three rows carrying identical green dots for an
+> unrelated reason read as a three-tier billing ladder, which is the exact
+> thing they were not. Freshness now lives inline (`(row from 13d ago)`) and in
+> the warning line beneath the block.
 
 ## Why this exists
 
@@ -204,6 +236,10 @@ That line only appears when a cached row is actually on screen.
 - `used_percentage` and the dollar figures are scraped independently, so they can
   disagree slightly. The "credit" figure is a prepaid balance, **not**
   limit-minus-spent.
+- The paying-pool marker is inferred, not reported: the payload has no "you are
+  billing to X" field. An API key supplied outside the environment (e.g. stored
+  credentials) is detected only once the session has non-zero cost and still no
+  `rate_limits`.
 
 ## License
 

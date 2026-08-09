@@ -20,6 +20,12 @@
 # grid; bash only adds the session title and the git/model footer. Rows are
 # selected with STATUSLINE_ROWS — see ROW_BUILDERS below.
 #
+# The leading marker on each row answers "what is paying for this session?".
+# ▸ marks the one billing pool the next request draws from, ○ a billing pool
+# that is not currently paying, · a row that is not a billing pool at all.
+# Staleness is flagged inline per row and in the warning lines instead — it
+# used to own this column, which made three unrelated rows look like a ladder.
+#
 # Fields are passed back on a single line separated by US (0x1f) rather than
 # "|", which a session name or branch could contain.
 IFS=$'\x1f' read -r session_name model_label cwd repo_owner repo_name \
@@ -143,11 +149,18 @@ def row_age(entry):
     ts = (entry or {}).get("_fetched_at") or updated_at
     return (None if ts is None else time.time() - ts), ts
 
-def row_dot(entry):
-    age, _ = row_age(entry)
-    if age is None or age > STALE_AFTER:
-        return f"{GRAY}○{RESET}"
-    return f"{GREEN}●{RESET}"
+# Billing markers. Colour escalates with how the money is spent: green is
+# included in the subscription, yellow is overflow spend on top of it, red is
+# metered API spend. ○ is a billing pool that exists but is not paying now;
+# · is a row that is not a billing pool (context, session-cost estimate).
+MARK_INFO = f"{GRAY}·{RESET}"
+MARK_IDLE = f"{GRAY}○{RESET}"
+MARK_PAY = {"quota":   f"{GREEN}{BOLD}▸{RESET}",
+            "credits": f"{YELLOW}{BOLD}▸{RESET}",
+            "api":     f"{RED}{BOLD}▸{RESET}"}
+PAY_NOTE = {"quota":   f"  {GREEN}{BOLD}◂ billing here{RESET}",
+            "credits": f"  {YELLOW}{BOLD}◂ billing here — quota spent{RESET}",
+            "api":     f"  {RED}{BOLD}◂ billing here — metered API{RESET}"}
 
 def row_mark(entry):
     """Flag a row that is materially older than the scrape as a whole."""
@@ -168,18 +181,19 @@ def plain_row(dot, label, detail):
     bar rows so the block still reads as one grid."""
     return f"  {dot} {CYAN}{label:<{LBL}}{RESET}{PAD}{GRAY}{detail}{RESET}"
 
-def render_live(label, bucket):
+def render_live(label, bucket, suffix=""):
     """A quota row from the payload. Always current, so no staleness marking —
     it is read fresh on every render rather than out of a cache."""
     if not bucket:
         return None  # rate_limits is absent until the first API response
     pct = float(bucket.get("used_percentage") or 0)
-    return bar_row(f"{GREEN}●{RESET}", label, pct,
-                   "resets " + fmt_epoch(bucket.get("resets_at")))
+    marker = MARK_PAY["quota"] if paying == "quota" else MARK_IDLE
+    return bar_row(marker, label, pct,
+                   "resets " + fmt_epoch(bucket.get("resets_at")), suffix)
 
-def render_credits(label, entry):
+def render_credits(label, entry, marker, note=""):
     if not entry:
-        return f"  {GRAY}○{RESET} {CYAN}{label:<{LBL}}{RESET} {GRAY}no data{RESET}"
+        return f"  {marker} {CYAN}{label:<{LBL}}{RESET} {GRAY}no data{RESET}"
     pct = float(entry.get("used_pct", 0))
     spent = entry.get("spent")
     limit = entry.get("limit")
@@ -196,13 +210,44 @@ def render_credits(label, entry):
         if bal.strip().startswith("-"):
             auto_reload = entry.get("auto_reload", "?")
             warn = f"  {RED}{BOLD}![unpaid, auto-reload {auto_reload}]{RESET}"
-    return bar_row(row_dot(entry), label, pct, detail, warn + row_mark(entry))
+    return bar_row(marker, label, pct, detail, warn + note + row_mark(entry))
 
 
 plan = usage.get("plan")
 rate_limits = d.get("rate_limits") or {}
 ctx = d.get("context_window") or {}
 cost = d.get("cost") or {}
+
+# Which of the three pools is paying for this session. This is the question the
+# statusline exists to answer, so it is worked out once here and drives the
+# markers on every billing row.
+#
+#   quota   — the rolling 5-hour / 7-day subscription limits. Free at point of
+#             use; pays until either limit reaches 100%.
+#   credits — the usage-credit overflow add-on on that same plan. Takes over
+#             from quota at 100% so the session keeps running, and costs money.
+#   api     — a Console (platform.claude.com) account, billed per token. This is
+#             an *alternative* to the subscription, not a step after it: a
+#             session authenticated with an API key never touches quota or plan
+#             credits, and a subscription session never touches this.
+#
+# Detection: an API key in the environment is decisive. Otherwise rate_limits
+# is the fingerprint of a subscription — the payload only carries it for
+# Claude.ai plans. It is absent until the first API response, so a session that
+# has already been billed (non-zero cost) while carrying no buckets is an
+# API-key session whose key came from somewhere other than this environment.
+api_key_auth = bool(os.environ.get("ANTHROPIC_API_KEY")
+                    or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+_pcts = [float((rate_limits.get(k) or {}).get("used_percentage") or 0)
+         for k in ("five_hour", "seven_day") if rate_limits.get(k)]
+_billed = float(cost.get("total_cost_usd") or 0) > 0
+
+if api_key_auth or (_billed and not _pcts):
+    paying = "api"
+elif _pcts:
+    paying = "credits" if max(_pcts) >= 100 else "quota"
+else:
+    paying = None  # nothing billed yet — say nothing rather than guess
 
 # Which rows to draw, in order. Override with STATUSLINE_ROWS, e.g.
 #   STATUSLINE_ROWS=context,session,weekly       # no billing, no scraper
@@ -224,11 +269,12 @@ def build_context():
     tin = fmt_tokens(ctx.get("total_input_tokens"))
     tout = fmt_tokens(ctx.get("total_output_tokens"))
     detail = f"↓{tin}  ↑{tout}  ~{fmt_tokens(cache)}"
-    return [bar_row(f"{GREEN}●{RESET}", "Context", float(pct), detail)]
+    return [bar_row(MARK_INFO, "Context", float(pct), detail)]
 
 def build_session():
     label = f"Session (Claude {plan})" if plan else "Session"
-    return [render_live(label, rate_limits.get("five_hour"))]
+    suffix = PAY_NOTE["quota"] if paying == "quota" else ""
+    return [render_live(label, rate_limits.get("five_hour"), suffix)]
 
 def build_weekly():
     row = render_live("All models", rate_limits.get("seven_day"))
@@ -256,16 +302,22 @@ def build_cost():
         parts.append(f"+{added}/-{removed}")
     if secs:
         parts.append(fmt_dur(secs))
-    return [plain_row(f"{GREEN}●{RESET}", "This session", "  ·  ".join(parts)),
+    return [plain_row(MARK_INFO, "This session", "  ·  ".join(parts)),
             f"  {GRAY}↑ client-side estimate, resets on /clear{RESET}"]
 
 def build_plan_credits():
-    return [render_credits("Plan credits", usage.get("credits")),
-            f"  {GRAY}↑ usage-credits overflow (optional add-on){RESET}"]
+    on = paying == "credits"
+    return [render_credits("Plan credits", usage.get("credits"),
+                           MARK_PAY["credits"] if on else MARK_IDLE,
+                           PAY_NOTE["credits"] if on else ""),
+            f"  {GRAY}↑ overflow add-on — takes over when session/weekly hits 100%{RESET}"]
 
 def build_api_credits():
-    return [render_credits("API credits", usage.get("console_credits")),
-            f"  {GRAY}↑ separate account — not used by Claude Code{RESET}"]
+    on = paying == "api"
+    return [render_credits("API credits", usage.get("console_credits"),
+                           MARK_PAY["api"] if on else MARK_IDLE,
+                           PAY_NOTE["api"] if on else ""),
+            f"  {GRAY}↑ Console account — pays instead of the plan when authed by API key{RESET}"]
 
 ROW_BUILDERS = {
     "context": build_context,
